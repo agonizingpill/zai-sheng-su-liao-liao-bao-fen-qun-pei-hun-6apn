@@ -1,6 +1,7 @@
 export const ROLES={admin:'投料主管',blender:'配混员',viewer:'质检观察员'};
 export const BLEND_STATES={draft:'待称料',ready:'审秤通过',released:'已投料'};
-export const AUDIT_ACTIONS={bale_received:'来料登记',bale_retested:'料包复检',blend_created:'配方立单',weighed:'称料保存',checked:'审秤通过',blend_reopened:'退回秤台',released:'主管投料放行'};
+export const AUDIT_ACTIONS={bale_received:'来料登记',bale_retested:'料包复检',blend_created:'配方立单',weighed:'称料保存',checked:'审秤通过',blend_reopened:'退回秤台',released:'主管投料放行',clusters_queued:'分群已登记',clusters_claimed:'执行进程接管',clusters_published:'分群已发布',clusters_rejected:'分群发布被拒',clusters_failed:'分群计算失败'};
+export const CLUSTER_JOB_STATES={queued:'排队待算',running:'计算中',publishing:'发布校验中',published:'已发布',rejected:'已拒绝',failed:'计算失败'};
 
 export const LOT_STATES={active:'来料可用',quarantine:'整批隔离'};
 export const PELLET_STATES={quarantine:'PVC越限隔离',passed:'检验合格待签证',certified:'主管已发合格证'};

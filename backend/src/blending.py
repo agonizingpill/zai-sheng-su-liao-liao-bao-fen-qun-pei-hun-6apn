@@ -4,7 +4,6 @@ from fastapi import HTTPException
 from sqlalchemy import select,delete
 from .models import Bale,Blend,BlendPortion,Audit
 from .quality_models import SupplierLot,LotBale
-
 def obj(x):return {c.name:float(getattr(x,c.name)) if isinstance(getattr(x,c.name),Decimal) else getattr(x,c.name) for c in x.__table__.columns}
 def get(s,model,id,lock=False):
     q=select(model).where(model.id==id)
@@ -18,6 +17,7 @@ def view(s,b):
     d=obj(b);ps=portions(s,b);d['portions']=[{**obj(p),'bale_code':s.get(Bale,p.bale_id).code} for p in ps];d['total_kg']=float(sum((p.kg for p in ps),Decimal(0)));return d
 def set_portions(s,b,data,u):
     if b.status!='draft':raise HTTPException(409,'配方已审秤或已放行；先退回草稿才能调整')
+    from .cluster_service import membership_problem
     ids=[x.bale_id for x in data.portions]
     if len(set(ids))!=len(ids):raise HTTPException(409,'同一料包只能称入一次')
     bales={x.id:x for x in s.scalars(select(Bale).where(Bale.id.in_(ids)).order_by(Bale.id).with_for_update())}
@@ -25,6 +25,8 @@ def set_portions(s,b,data,u):
         x=bales.get(p.bale_id)
         if not x:raise HTTPException(404,'所选料包不存在')
         if x.cluster_id is None:raise HTTPException(409,'料包尚未完成分群检验')
+        problem=membership_problem(s,x)
+        if problem:raise HTTPException(409,problem+'；未保存配方，请等待分群完整发布后重试')
         if p.kg>x.available_kg:raise HTTPException(409,f'{x.code}可用重量不足，未保存配方')
     s.execute(delete(BlendPortion).where(BlendPortion.blend_id==b.id))
     for p in data.portions:
@@ -41,6 +43,14 @@ def validate(s,b,locked_bales=None):
     ids=sorted(p.bale_id for p in ps)
     if locked_bales is None:
         locked_bales={x.id:x for x in s.scalars(select(Bale).where(Bale.id.in_(ids)).order_by(Bale.id).with_for_update())}
+    # The snapshot is the contract. A later retest must not silently change
+    # what this blend is made of; it must be re-weighed. A re-cluster only
+    # changes the yard's current group, and established blends keep the group
+    # they were weighed with, so the version itself is not compared here.
+    for p in ps:
+        bale=locked_bales[p.bale_id] if locked_bales is not None else get(s,Bale,p.bale_id)
+        if (bale.pvc_ppm,bale.melt_index,bale.moisture)!=(p.pvc_snapshot,p.melt_snapshot,p.moisture_snapshot):
+            raise HTTPException(409,f'{bale.code}的质量已变化，与称料快照不一致；请退回并整体重新称料')
     lot_ids=list(s.scalars(select(LotBale.lot_id).where(LotBale.bale_id.in_(ids)).distinct().order_by(LotBale.lot_id)))
     lots=list(s.scalars(select(SupplierLot).where(SupplierLot.id.in_(lot_ids)).order_by(SupplierLot.id).with_for_update().execution_options(populate_existing=True)))
     if any(x.state=='quarantine' for x in lots):raise HTTPException(409,'供应批次已隔离，不能审秤或最终投料放行')

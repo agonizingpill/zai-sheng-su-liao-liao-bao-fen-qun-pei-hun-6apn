@@ -1,4 +1,5 @@
 import random,json
+from datetime import datetime,timezone
 from decimal import Decimal
 from sqlalchemy import select,func
 from src.database import Base,engine,Session
@@ -6,6 +7,9 @@ from src.models import User,Bale,Blend,BlendPortion
 from src.quality_models import SupplierLot,LotBale,PelletCheck
 from src.blending import obj
 from src.production_models import Dryer,DryingRun,PelletPack,BlendShipment,ShipmentPack
+from src.cluster_models import ClusterJob
+from src import cluster_service
+from src.clustering import cluster
 from src.security import password_hash
 
 def seed():
@@ -32,5 +36,17 @@ def seed():
                 bale=s.scalar(select(Bale).where(Bale.code==bale_code))
                 if not s.scalar(select(LotBale.id).where(LotBale.bale_id==bale.id)):
                     s.add(LotBale(lot_id=lot.id,bale_id=bale.id,received_snapshot=obj(bale)))
-    with Session() as s:print(json.dumps({k:s.scalar(select(func.count()).select_from(v)) for k,v in [('users',User),('bales',Bale),('blends',Blend),('portions',BlendPortion),('supplier_lots',SupplierLot),('lot_bales',LotBale),('pellet_checks',PelletCheck),('dryers',Dryer),('drying_runs',DryingRun),('packs',PelletPack),('shipments',BlendShipment),('shipment_packs',ShipmentPack)]}))
+        # A fresh demo yard needs one complete published version before anyone
+        # may pick bales. Existing databases keep their published history.
+        if not s.scalar(select(ClusterJob.version).where(ClusterJob.status=='published',ClusterJob.version.isnot(None)).limit(1)):
+            bales=s.scalars(select(Bale).order_by(Bale.id)).all()
+            labels,result=cluster(bales)
+            stamp=datetime.now(timezone.utc).isoformat()
+            rows=cluster_service.snapshot_bales(bales)
+            s.flush()
+            job=ClusterJob(status='published',requested_by='seed@huanli.local',requested_at=stamp,started_at=stamp,finished_at=stamp,published_at=stamp,attempt=1,bale_count=len(rows),bale_ids=[r['id'] for r in rows],fingerprint=cluster_service.fingerprint(rows),input_snapshot=rows,lease_token=0)
+            s.add(job);s.flush()
+            job.version=job.id;job.result={**result,'version':job.id,'job_id':job.id,'bale_count':len(bales),'published_at':stamp,'requested_by':'seed@huanli.local'}
+            for b,label in zip(bales,labels):b.cluster_id=int(label);b.cluster_version=job.id
+    with Session() as s:print(json.dumps({k:s.scalar(select(func.count()).select_from(v)) for k,v in [('users',User),('bales',Bale),('blends',Blend),('portions',BlendPortion),('supplier_lots',SupplierLot),('lot_bales',LotBale),('pellet_checks',PelletCheck),('dryers',Dryer),('drying_runs',DryingRun),('packs',PelletPack),('shipments',BlendShipment),('shipment_packs',ShipmentPack),('cluster_jobs',ClusterJob)]}))
 if __name__=='__main__':seed()

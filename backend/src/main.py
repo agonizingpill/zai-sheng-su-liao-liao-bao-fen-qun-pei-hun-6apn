@@ -11,6 +11,7 @@ from .schemas import Login,BaleIn,BlendIn,PortionsIn
 from .security import current,allow,password_hash,token_for
 from .blending import obj,get,audit,view,set_portions,evaluate,release
 from .middlewares import RequestTrace,Recovery
+from . import cluster_service as cluster_jobs
 from scripts.seed_demo import seed
 import json
 logging.basicConfig(level=logging.INFO)
@@ -54,16 +55,26 @@ def edit_bale(id:int,d:BaleIn,u=Depends(current)):
         b=get(s,Bale,id,True)
         if s.scalar(select(BlendPortion.id).where(BlendPortion.bale_id==id).limit(1)):raise HTTPException(409,'料包已被配方引用，质量与原始重量快照冻结')
         for k,v in d.model_dump().items():setattr(b,k,v)
+        # A retested bale leaves the published roster until the next full
+        # publish; established blends keep their own snapshot untouched.
         b.available_kg=d.kg;b.cluster_id=None;b.cluster_version=None;audit(s,u,'bale_retested',b.code);return obj(b)
 @app.get('/clusters')
 def clusters(u=Depends(current)):
-    return {'status':r.get('poly-cluster-state') or 'idle','result':json.loads(r.get('poly-cluster-result') or 'null'),'error':r.get('poly-cluster-error')}
+    with Session() as s:return cluster_jobs.overview(s,json.loads(r.get('poly-cluster-result') or 'null'),r.get('poly-cluster-error'))
 @app.post('/clusters/rebuild')
 def rebuild(u=Depends(current)):
     allow(u,'admin','blender')
-    if not r.set('poly-cluster-lock','1',nx=True,ex=120):raise HTTPException(409,'分群正在计算，请稍后查看')
-    r.set('poly-cluster-state','queued');r.delete('poly-cluster-error');r.rpush('poly-cluster','all')
-    return {'status':'queued'}
+    with Session.begin() as s:
+        job=cluster_jobs.enqueue(s,u);job_id=job.id
+    try:r.rpush('poly-cluster-wakeup','job')
+    except Exception:logging.warning('redis wake-up failed; worker poll will pick up job #%s',job_id)
+    return {'status':'queued','job_id':job_id,'message':'分群已登记，计算完成后统一发布'}
+@app.get('/clusters/jobs')
+def cluster_job_list(u=Depends(current)):
+    with Session() as s:return [cluster_jobs.job_view(x) for x in cluster_jobs.recent_jobs(s,30)]
+@app.get('/clusters/jobs/{id}')
+def cluster_job(id:int,u=Depends(current)):
+    with Session() as s:return cluster_jobs.job_view(cluster_jobs.get_job(s,id))
 @app.get('/blends')
 def blends(u=Depends(current)):
     with Session() as s:return [view(s,b) for b in s.scalars(select(Blend).order_by(Blend.id.desc()))]

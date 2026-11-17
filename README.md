@@ -24,7 +24,7 @@ docker compose exec -T backend python -m scripts.seed_demo
 ## 业务流程与约束
 
 1. 料包堆场登记编号、原始kg、熔指、水分、PVC。编号唯一；可用量不小于零且不超过原始重量。
-2. 可混群落由Python worker实际计算，输入三项检验特征。未分群新料不能直接称入。
+2. 可混群落由Python worker实际计算，输入三项检验特征。分群请求写入MySQL的`cluster_jobs`，Redis只做唤醒提示；任务不可因进程退出而丢失。计算期间不锁堆场，检验登记、称料、审秤和主管投料照常进行。未分群新料不能直接称入，选料只采用**最新一次完整发布**的版本及其发布时的质量值。
 3. 配混秤台立单目标kg与PVC上限；每份称料行关联配方与料包，保存**群号、分群版本及质量快照**。同包不可重复，保存时就拒绝超过当前可用量。
 4. 审秤校验同版本同群、总重等于目标、Σ(重量×PVC)/总重≤上限、每包可用量足够；全部通过进入ready。审秤不扣料。
 5. 主管放行先锁配方，再按料包ID顺序`SELECT FOR UPDATE`；重新校验余量后，在一个事务扣减所有料包，配方变released并保存签署人。任一失败整体回滚。重复放行、已放行改单和退回都拒绝。
@@ -36,7 +36,9 @@ docker compose exec -T backend python -m scripts.seed_demo
 9. 包装箱码追溯：certified成品按唯一箱码分包，锁同成品校验有效包装累计≤actual_kg；open可改重或取消释放额度，sealed后冻结，证书快照随箱保存。已装车仍计入累计，避免重复包装同一产出。
 10. 装车客户签收：同车只能装同配方sealed箱，ShipmentPack.pack_id唯一，加载后包状态loaded阻止再次出库；主管发车保存冻结manifest。实收与清单差率绝对值>0.5%须至少8字依据，记录客户签收快照后不得重复签收。仅本地记录交接，无实际运输消息。
 
-已被任何配方引用的料包质量/原始重量不得修改；可用量只在放行扣减。重做全场分群会更新堆场当前群号，既有配方继续使用原称料时的质量/群号快照。对旧快照配方添加新版本料包会被审秤拦截，需退回并整体重新称料。
+11. 分群发布：任务状态为`queued→running→publishing→published|rejected|failed`并全部落库可追查。发布事务先锁堆场，核对参与料包**名单**（新增/缺失）与**质量**（熔指、水分、PVC）是否仍与模型实际读取的数据一致；任一变化即`rejected`并写明原因，旧发布版本不被覆盖，料包不写新群号。群号与中心报告（centers/inertia/轮廓系数）在同一事务同时生效。执行进程持带到期时间的租约与递增的**围栏令牌**；进程中断后租约到期，另一进程接管并递增令牌，迟到的原执行者无法发布或改写接管结果。重试仅当任务仍`published`时幂等返回，不会重复发布。同一时间只允许一个活动任务。
+
+已被任何配方引用的料包质量/原始重量不得修改；可用量只在放行扣减。重做全场分群会更新堆场当前群号，既有配方继续使用原称料时的质量/群号快照。审秤与放行按快照复核质量：发布后料包若被复检改写，与快照不一致则拒绝并要求退回整体重新称料；仅群号随重新分群变化不影响既有配方。对旧快照配方添加新版本料包会被审秤拦截。
 
 ### 一天的工作剧本
 
@@ -48,7 +50,7 @@ V3演练：11月24日DRY-B接BL-PELLET-UI的100kg投料，08:00—12:00烘干；
 
 ## 真实ML计算
 
-`StandardScaler`对熔指、水分和PVC标准化，`KMeans(n_clusters=3,n_init=10,random_state=42)`聚类，输出每包标签、原量纲群中心、inertia与轮廓系数。群号按中心熔指从低到高排序。输入按料包ID排序，seed42可复现。至少6包且至少3种不同特征；不足时拒绝并保留现有结果。轮廓系数是当前无监督分群的结构描述，不是训练/留出预测准确率。演示seed45包分三种材料范围；实际检验数据未接入，不能把演示分群质量当作实际投料质量保证，配方PVC和重量门限仍是后端硬约束。
+`StandardScaler`对熔指、水分和PVC标准化，`KMeans(n_clusters=3,n_init=10,random_state=42)`聚类，输出每包标签、原量纲群中心、inertia与轮廓系数。群号按中心熔指从低到高排序。输入按料包ID排序，seed42可复现。至少6包且至少3种不同特征；不足时任务记`failed`并保留现有发布结果。轮廓系数是当前无监督分群的结构描述，不是训练/留出预测准确率。演示seed45包分三种材料范围；实际检验数据未接入，不能把演示分群质量当作实际投料质量保证，配方PVC和重量门限仍是后端硬约束。
 
 ## 技术栈与目录
 
@@ -56,24 +58,24 @@ V3演练：11月24日DRY-B接BL-PELLET-UI的100kg投料，08:00—12:00烘干；
 |---|---|
 |前端|原生HTML/CSS/ES modules，Nginx1.27，双字体、工业材料标签布局|
 |API|Python3.12/FastAPI/SQLAlchemy2/PyMySQL|
-|算法|scikit-learn1.6/NumPy，Redis7队列独立worker|
+|算法|scikit-learn1.6/NumPy，MySQL任务表 + 租约围栏独立worker（Redis仅唤醒）|
 |数据库|MySQL8，Decimal重量和ppm，外键、唯一键、范围约束，64位分群版本|
 |横切|JWT8小时、PBKDF2口令、三角色、业务审计、请求追踪、全局错误恢复|
 
-`backend/src/models.py`：Bale、Blend、BlendPortion；`schemas.py`：字段范围；`blending.py`：称料、审秤、放行事务；`clustering.py`：实际算法；`worker.py`：队列与心跳；`main.py`：路由；`middlewares.py`：追踪/恢复。`backend/scripts/seed_demo.py`自然键只插入缺失演示记录，重复seed保留用户修改。
+`backend/src/models.py`：Bale、Blend、BlendPortion；`cluster_models.py`：ClusterJob（状态、租约、围栏令牌、输入与计算快照、结果与拒绝原因）；`cluster_service.py`：入队、认领/接管、租约续期、发布校验与原子发布；`clustering.py`：实际算法；`worker.py`：轮询任务表、续租与心跳；`main.py`：路由（`/clusters`、`/clusters/rebuild`、`/clusters/jobs`）；`schemas.py`：字段范围；`blending.py`：称料、审秤、放行事务；`middlewares.py`：追踪/恢复。`backend/scripts/seed_demo.py`自然键只插入缺失演示记录，重复seed保留用户修改。
 
 `backend/src/quality_models.py`：SupplierLot/LotBale/PelletCheck；`quality_schemas.py`：批次、决策、取样与复检字段；`quality_service.py`：追溯挂批/主管隔离、质量平衡、历次检验与证书快照；`quality_routes.py`：`/supplier-lots` 与 `/pellet-checks`（含bales/quarantine/clear/retest/certify）。新建三张表，不修改原表列，已有数据通过create_all扩展，无破坏性迁移。
 
 V3 `backend/src/production_models.py`定义Dryer/DryingRun/PelletPack/BlendShipment/ShipmentPack；`production_schemas.py`校验时间、含水、称重与客户收货；`production_service.py`设备锁/时段重叠、累计包装锁、装车唯一和签收差率；`production_routes.py`提供`/dryers`、`/drying-runs`、`/pellet-packs`、`/blend-shipments`。新加5张表，原表列无变更，create_all兼容历史记录。
 
-`frontend/src/pages/yard.js`堆场；`clusters.js`真实散点与中心；`bench.js`可增删称料行；`release.js`交接簿；`lots.js`供应隔离复核；`pellets.js`粒料检验与证书；`drying.js`含水复检；`packs.js`包装箱码；`shipments.js`装车客户签收。`components/labels.js`共享群标签、状态条、标签页、标题与通知，群标签在图谱、秤台与放行中复用。`utils/api.js`会话/接口/store，`utils/format.js`数字/转义/上海时区。角色、配方状态、供应批、成品检验、烘干、包装和装车状态枚举定义在`backend/src/constants.py`、`frontend/src/constants.js`，状态实际转移在`blending.py`与`main.py`，标签渲染在`components/labels.js`。
+`frontend/src/pages/yard.js`堆场；`clusters.js`真实散点、中心、任务进度/拒绝原因与任务轨迹；`bench.js`可增删称料行（下拉只列完整发布版本的料包）；`release.js`交接簿；`lots.js`供应隔离复核；`pellets.js`粒料检验与证书；`drying.js`含水复检；`packs.js`包装箱码；`shipments.js`装车客户签收。`components/labels.js`共享群标签、状态条、标签页、标题与通知，群标签在图谱、秤台与放行中复用。`utils/api.js`会话/接口/store，`utils/format.js`数字/转义/上海时区。角色、配方状态、供应批、成品检验、烘干、包装和装车状态枚举定义在`backend/src/constants.py`、`frontend/src/constants.js`，状态实际转移在`blending.py`与`main.py`，标签渲染在`components/labels.js`。
 
-Compose恰好frontend/backend/worker/db/redis五服务，全部healthcheck。MySQL健康检查采用127.0.0.1业务账号SELECT1，避开初始化临时socket；前端和后端也用127.0.0.1。数据库、Redis和模型文件/心跳分别为命名卷。宿主默认地址池已用尽，本项目显式10.221.26.0/24；换环境冲突时调整networks。环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET。内网DATABASE_URL/REDIS_URL/SEED_DEMO由Compose设置。
+Compose为frontend/backend/两个worker/db/redis六服务，全部healthcheck；两个worker并发取任务，同一任务只会有一个取得围栏令牌，另一个可在前者中断后按到期租约接管。worker健康检查读取进程级心跳文件`poly-heartbeat-<hostname>`，某个副本停滞不会被同伴的心跳掩盖。MySQL健康检查采用127.0.0.1业务账号SELECT1，避开初始化临时socket；前端和后端也用127.0.0.1。数据库、Redis和模型文件/心跳分别为命名卷。宿主默认地址池已用尽，本项目显式10.221.26.0/24；换环境冲突时调整networks。环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET。内网DATABASE_URL/REDIS_URL/SEED_DEMO由Compose设置。
 
 本地开发：在backend目录`pip install -r requirements.txt`，设置MySQL/Redis连接后`uvicorn src.main:app --reload`；前端由Nginx代理API。测试与截图单独放在外层`test-artifacts/gb-1026`，不会混入源码。
 
 ## 已知范围
 
-模拟45包检验资料，不接地磅/化验仪；无物理投料设备联动。配方与成品以PVC、重量平衡为硬门限，成品记录正值MI，未加入具体产品应用的MI/水分区间。供应来料隔离不追溯撤销已经投料和已经签发的成品证书；历史快照保留。成品包装与装车在本地记录受控出库清单，不接外部仓储或销售财务。烘干每配方一单，含水按实际取样手录，不接设备传感器或能耗表；设备时段包括已验收历史，不能重叠回填。未实现封箱拆包/已发车撤销，避免不受控重复出库。一个worker、Redis list；取任务后worker异常退出无可靠重投。每次聚类在全场已检验料包上计算，分群是辅助选料，不替代检测。历史已放行配方不可撤销，避免演示中不受控返库。演示JWT secret与账号密码在正式部署前更换。
+模拟45包检验资料，不接地磅/化验仪；无物理投料设备联动。配方与成品以PVC、重量平衡为硬门限，成品记录正值MI，未加入具体产品应用的MI/水分区间。供应来料隔离不追溯撤销已经投料和已经签发的成品证书；历史快照保留。成品包装与装车在本地记录受控出库清单，不接外部仓储或销售财务。烘干每配方一单，含水按实际取样手录，不接设备传感器或能耗表；设备时段包括已验收历史，不能重叠回填。未实现封箱拆包/已发车撤销，避免不受控重复出库。分群任务持久化在MySQL，单个worker进程异常退出后由租约到期自动接管（最多`CLUSTER_MAX_ATTEMPTS`次，默认3次），无需人工重投；多执行进程并发只会有一个取得令牌。仍是单库单写，未做跨区多主。每次聚类在发起时登记的全场已检验料包上计算，分群是辅助选料，不替代检测。历史已放行配方不可撤销，避免演示中不受控返库。演示JWT secret与账号密码在正式部署前更换。
 
 License: MIT.
